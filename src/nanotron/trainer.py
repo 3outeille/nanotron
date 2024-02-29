@@ -1,3 +1,4 @@
+import contextlib
 import datetime
 import json
 import os
@@ -7,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 from pprint import pformat
 from typing import (
+    Any,
     Callable,
     Dict,
     Iterable,
@@ -19,20 +21,32 @@ from typing import (
 )
 
 import torch
-from brrr.models.mamba_fast.mamba import MambaFastForTraining
 from torch.nn.parallel import DistributedDataParallel
 
 from nanotron import distributed as dist
 from nanotron import logging
+
+# from brrr.models.mamba_fast.mamba import MambaFastForTraining
 from nanotron.config import (
     Config,
     ExistingCheckpointInit,
+    HubTensorBoardLoggerConfig,
     MambaInit,
     ParallelismArgs,
     RandomInit,
+    TensorboardLoggerConfig,
+    WandbLoggerConfig,
     get_config_from_file,
 )
 from nanotron.dataloader import sanity_check_dataloader
+from nanotron.experiment_loggers import (
+    BatchSummaryWriter,
+    HubSummaryWriter,
+    LoggerWriter,
+    WandBLogger,
+    hf_tensorboard_logger_available,
+    obj_to_markdown,
+)
 from nanotron.helpers import (
     _vocab_size_with_padding,
     get_profiler,
@@ -92,13 +106,13 @@ logger = logging.get_logger(__name__)
 
 # Reduce the logging noise from torch.distributed when creating new process groups
 dist_logger = logging.get_logger(dist.dist.__name__)
-dist_logger.setLevel(logging.WARNING)
+# dist_logger.setLevel(logging.WARNING)
 
 CONFIG_TO_MODEL_CLASS = {
     "LlamaConfig": LlamaForTraining,
     "Starcoder2Config": Starcoder2ForTraining,
     "MambaConfig": MambaForTraining,
-    "MambaFastConfig": MambaFastForTraining,
+    # "MambaFastConfig": MambaFastForTraining,
 }
 
 try:
@@ -243,19 +257,115 @@ class DistributedTrainer:
         pass
 
     def post_init(self):
-        pass
+        ########################################
+        ## Some logging after all is setup
+        ########################################
+
+        # Setup experiemnt writers
+        wb_context = contextlib.nullcontext()
+        tb_context = contextlib.nullcontext()
+        loggerwriter = None
+        if dist.get_rank(self.parallel_context.world_pg) in self.logger_ranks:
+            loggerwriter = LoggerWriter(global_step=self.config.tokens.train_steps)
+            if (
+                self.config.experiment_logger is not None
+                and self.config.experiment_logger.tensorboard_logger is not None
+            ):
+                logdir = str(
+                    self.config.experiment_logger.tensorboard_logger.tensorboard_dir / self.config.general.run
+                )
+
+                if isinstance(self.config.experiment_logger.tensorboard_logger, HubTensorBoardLoggerConfig):
+                    assert (
+                        hf_tensorboard_logger_available
+                    ), 'Hub Tensorboard Logger is not available. Please install brrr with `pip install -e ".[hf-logger]"` or modify your config file'
+                    log_rank(f"Adding tensorboard logger at {logdir}", logger=logger, level=logging.INFO)
+                    tb_context = HubSummaryWriter(
+                        logdir=logdir,
+                        repo_id=self.config.experiment_logger.tensorboard_logger.repo_id,
+                        repo_private=not self.config.experiment_logger.tensorboard_logger.repo_public,
+                        path_in_repo="tb",
+                    )
+                elif isinstance(self.config.experiment_logger.tensorboard_logger, TensorboardLoggerConfig):
+                    tb_context = BatchSummaryWriter(
+                        logdir=logdir,
+                        flush_secs=self.config.experiment_logger.tensorboard_logger.flush_secs,
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported value for `config.experiment_logger.tensorboard_logger`, got {self.config.experiment_logger.tensorboard_logger}"
+                    )
+                if isinstance(self.config.experiment_logger.wandb_logger, WandbLoggerConfig):
+                    if not isinstance(
+                        self.config.experiment_logger.tensorboard_logger,
+                        (HubTensorBoardLoggerConfig, TensorboardLoggerConfig),
+                    ):
+                        raise ValueError(
+                            "WandbLoggerConfig requires a TensorboardLoggerConfig or a HubTensorBoardLoggerConfig to be set in the config file"
+                        )
+                    try:
+                        import wandb
+
+                        resume = self.config.checkpoints.resume_checkpoint_path is not None
+                        wandb.tensorboard.patch(root_logdir=logdir)
+                        wandb.init(
+                            project=self.config.experiment_logger.wandb_logger.wandb_project,
+                            entity=self.config.experiment_logger.wandb_logger.wandb_entity,
+                            name=self.config.general.run,
+                            config=self.config.as_dict(),
+                            sync_tensorboard=True,
+                            resume=resume,
+                        )
+                        wb_context = WandBLogger()
+
+                        print("WandbLoggerConfig is enabled")
+                    except ImportError:
+                        raise ImportError("Please install wandb to use the WandbLoggerConfig")
+
+        self.tb_context = tb_context
+        self.wb_context = wb_context
+        self.loggerwriter = loggerwriter
+
+        # Log config and model config
+        self.log_object(self.config, "config")
+        if hasattr(self.model_config, "to_json_string"):
+            model_config_dict = json.loads(self.model_config.to_json_string())
+        else:
+            model_config_dict = asdict(self.model_config)
+        self.log_object(model_config_dict, "model_config")
 
     def pre_training(self, *args, **kwargs):
-        current_time = datetime.datetime.now().strftime("%d/%m/%Y_%H:%M:%S")
-        if dist.get_rank(self.parallel_context.world_pg) == 0 and wandb is not None:
-            wandb.init(
-                project=self.config.general.project,
-                name=f"{current_time}_{self.config.general.project}_{self.config.general.run}",
-                config={"nanotron_config": self.config.as_dict()},
-            )
+        pass
+
+    def log_object(self, dataclass_object: Any, name: str):
+        if not dataclass_object or isinstance(self.tb_context, contextlib.nullcontext):
+            return
+
+        self.tb_context.add_text(name, obj_to_markdown(dataclass_object), global_step=1)
+
+        # Dataclass objects are usually configs so we push then already now
+        self.tb_context.flush()
+
+        if isinstance(self.tb_context, HubSummaryWriter):
+            self.tb_context.scheduler.trigger()
 
     def post_train_step(self):
-        pass
+        # Kill switch
+        # self.check_kill_switch(save_ckpt=True)
+
+        # Push to Hub
+        if (
+            isinstance(self.tb_context, HubSummaryWriter)
+            and (self.iteration_step - 1) % self.config.experiment_logger.tensorboard_logger.push_to_hub_interval == 0
+        ):
+            # self.tb_context only exists on a single rank
+            log_rank(
+                f"Push Tensorboard logging to Hub at iteration {self.iteration_step} to https://huggingface.co/tensorboard/{self.config.experiment_logger.tensorboard_logger.repo_id}/",
+                logger=logger,
+                level=logging.INFO,
+            )
+            # it is a future that queues to avoid concurrent push
+            self.tb_context.scheduler.trigger()
 
     def post_training(self):
         pass
@@ -486,10 +596,10 @@ class DistributedTrainer:
                     ]
                 )
 
-            if wandb is not None:
-                wandb.log(
-                    {**{log_item.tag: log_item.scalar_value for log_item in log_entries}, "step": self.iteration_step}
-                )
+            if not isinstance(self.tb_context, contextlib.nullcontext):
+                self.tb_context.add_scalars_from_list(log_entries, self.iteration_step)
+            if isinstance(self.wb_context, WandBLogger):
+                self.wb_context.add_scalars_from_list(log_entries, self.iteration_step)
 
             self.loggerwriter.add_scalars_from_list(log_entries, self.iteration_step)
 

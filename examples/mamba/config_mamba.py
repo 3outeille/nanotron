@@ -12,11 +12,14 @@ from nanotron.config import (
     MambaConfig,
     MambaInit,
     ModelArgs,
+    NanotronExperimentLoggerArgs,
     OptimizerArgs,
     ParallelismArgs,
     PretrainDatasetsArgs,
+    TensorboardLoggerConfig,
     TokenizerArgs,
     TokensArgs,
+    WandbLoggerConfig,
 )
 from nanotron.logging import human_format
 
@@ -89,6 +92,19 @@ print(f"Model has {num_params} parameters")
 
 seed = 42
 
+general = GeneralArgs(project="test", run="mamba", seed=seed)
+
+checkpoints_path = os.path.dirname(os.path.dirname(__file__)) + "/checkpoints"
+os.makedirs(checkpoints_path, exist_ok=True)
+checkpoints = CheckpointsArgs(checkpoints_path=checkpoints_path, checkpoint_interval=10)
+
+model = ModelArgs(
+    init_method=MambaInit(initializer_range=0.02, rescale_prenorm_residual=True, n_residuals_per_layer=1),
+    model_config=model_config,
+)
+
+tokenizer = TokenizerArgs("gpt2")
+
 optimizer = OptimizerArgs(
     zero_stage=0,
     weight_decay=0.01,
@@ -114,31 +130,40 @@ parallelism = ParallelismArgs(
 
 tokens = TokensArgs(sequence_length=2048, train_steps=100, micro_batch_size=2, batch_accumulation_per_replica=1)
 
-dataset = PretrainDatasetsArgs(
-    hf_dataset_or_datasets={"roneneldan/TinyStories": 1.0},
-    hf_dataset_config_name=None,
-    hf_dataset_splits="train",
-    dataset_processing_num_proc_per_process=24,
-    dataset_overwrite_cache=False,
-    text_column_name="text",
+data = DataArgs(
+    dataset=PretrainDatasetsArgs(
+        hf_dataset_or_datasets={"roneneldan/TinyStories": 1.0},
+        hf_dataset_config_name=None,
+        hf_dataset_splits="train",
+        dataset_processing_num_proc_per_process=24,
+        dataset_overwrite_cache=False,
+        text_column_name="text",
+    ),
+    seed=seed,
 )
 
-checkpoints_path = os.path.dirname(os.path.dirname(__file__)) + "/checkpoints"
-os.makedirs(checkpoints_path, exist_ok=True)
+logging = LoggingArgs(
+    log_level="info",
+    log_level_replica="info",
+    iteration_step_info_interval=1,
+)
+
+experiment_logger = NanotronExperimentLoggerArgs(
+    tensorboard_logger=TensorboardLoggerConfig(tensorboard_dir="/fsx/ferdinandmom/logs/tb_logs/"),
+    wandb_logger=WandbLoggerConfig(wandb_project="test", wandb_entity="bouteille"),
+)
 
 config = Config(
-    general=GeneralArgs(project="test", run="mamba", seed=seed),
-    checkpoints=CheckpointsArgs(checkpoints_path=checkpoints_path, checkpoint_interval=10),
+    general=general,
+    checkpoints=checkpoints,
     parallelism=parallelism,
-    model=ModelArgs(
-        init_method=MambaInit(initializer_range=0.02, rescale_prenorm_residual=True, n_residuals_per_layer=1),
-        model_config=model_config,
-    ),
-    tokenizer=TokenizerArgs("gpt2"),
+    model=model,
+    tokenizer=tokenizer,
     optimizer=optimizer,
-    logging=LoggingArgs(),
+    logging=logging,
     tokens=tokens,
-    data=DataArgs(dataset=dataset, seed=seed),
+    data=data,
+    experiment_logger=experiment_logger,
     profiler=None,
 )
 

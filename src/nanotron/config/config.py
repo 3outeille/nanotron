@@ -10,6 +10,7 @@ import yaml
 from dacite import from_dict
 from yaml.loader import SafeLoader
 
+from nanotron.config.experiments_loggers_config import NanotronExperimentLoggerArgs
 from nanotron.config.lighteval_config import LightEvalConfig
 from nanotron.config.models_config import (
     ExistingCheckpointInit,
@@ -301,6 +302,7 @@ class Config:
     optimizer: Optional[OptimizerArgs] = None
     data: Optional[DataArgs] = None
     profiler: Optional[ProfilerArgs] = None
+    experiment_logger: Optional[NanotronExperimentLoggerArgs] = None
     lighteval: Optional[LightEvalConfig] = None
 
     @classmethod

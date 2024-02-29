@@ -1,11 +1,14 @@
 import functools
+import importlib
+import importlib.metadata as importlib_metadata
 import inspect
 import math
 import os
 import random
 import socket
+import warnings
 from contextlib import ExitStack, contextmanager
-from typing import Callable, ContextManager, List, Optional
+from typing import Callable, ContextManager, List, Optional, Tuple, Union
 
 import torch
 from packaging import version
@@ -52,7 +55,7 @@ def main_rank_first(group: dist.ProcessGroup):
 @contextmanager
 def local_ranks_zero_first(group: Optional[dist.ProcessGroup] = None):
     """Context manager that executes the code in the context with all the local rank zero of the group going first.
-    Usefull to run only once per node first (e.g. to create local files, etc)
+    Useful to run only once per node first (e.g. to create local files, etc)
     """
     is_main = int(os.environ.get("LOCAL_RANK", 0)) == 0
     if is_main:
@@ -123,6 +126,26 @@ def get_untyped_storage(tensor: torch.Tensor) -> torch.UntypedStorage:
     else:
         return tensor.storage().untyped()
 
+
+def init_method_normal(sigma: float) -> Callable[[torch.Tensor], None]:
+    """Init method based on N(0, sigma)."""
+
+    def init_(tensor: torch.Tensor):
+        torch.nn.init.normal_(tensor, mean=0.0, std=sigma)
+
+    return init_
+
+
+def scaled_init_method_normal(sigma: float, num_layers: int) -> Callable[[torch.Tensor], None]:
+    """Init method based on N(0, sigma/sqrt(2*num_layers)."""
+    std = sigma / math.sqrt(2.0 * num_layers)
+
+    def init_(tensor: torch.Tensor):
+        torch.nn.init.normal_(tensor, mean=0.0, std=std)
+
+    return init_
+
+
 def tensor_from_untyped_storage(untyped_storage: torch.UntypedStorage, dtype: torch.dtype):
     # TODO @thomasw21: Figure out what's the best Pytorch way of building a tensor from a storage.
     device = untyped_storage.device
@@ -141,3 +164,53 @@ def find_free_port(min_port: int = 2000, max_port: int = 65000) -> int:
                 return port
         except OSError:
             continue
+
+
+def check_env():
+    if os.environ.get("CUDA_LAUNCH_BLOCKING", None) == "1":
+        raise RuntimeError("CUDA_LAUNCH_BLOCKING is set to 1. " "This will make distributed NCCL hang.")
+    if os.environ.get("USE_FAST", None) != "1":
+        warnings.warn(
+            "USE_FAST is not set. In case you're using a model from brrr, this will use the slow version of the code. "
+            "Set USE_FAST=1 to use the fast version of the code."
+        )
+    if os.environ.get("FI_PROVIDER", None) != "efa":
+        warnings.warn("FI_PROVIDER is not set to efa. This will not use EFA for communication.")
+
+
+# https://github.com/huggingface/transformers/blob/f67dac97bdc63874f2288546b3fa87e69d2ea1c8/src/transformers/utils/import_utils.py#L41
+def _is_package_available(pkg_name: str, return_version: bool = False) -> Union[Tuple[bool, str], bool]:
+    # Check we're not importing a "pkg_name" directory somewhere but the actual library by trying to grab the version
+    package_exists = importlib.util.find_spec(pkg_name) is not None
+    package_version = "N/A"
+    if package_exists:
+        try:
+            package_version = importlib_metadata.version(pkg_name)
+            package_exists = True
+        except importlib_metadata.PackageNotFoundError:
+            package_exists = False
+    if return_version:
+        return package_exists, package_version
+    else:
+        return package_exists
+
+
+def _can_import_from_module(module: str, name: str) -> bool:
+    """
+    Check if a specific module can be imported from a package.
+    """
+    if not _is_package_available(module):
+        return False
+    try:
+        spec = importlib.util.find_spec(module)
+        module_obj = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module_obj)
+        return hasattr(module_obj, name)
+    except Exception as e:
+        warnings.warn(f"Unable to import {name} from {module}: {e}")
+        return False
+
+
+TENSORBOARDX_AVAILABLE = _is_package_available("tensorboardX")
+HUGGINGFACE_HUB_AVAILABLE = _is_package_available("huggingface_hub")
+HF_TENSORBOARD_LOGGER_AVAILABLE = _can_import_from_module("huggingface_hub", "HFSummaryWriter")
